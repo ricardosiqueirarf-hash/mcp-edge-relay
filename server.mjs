@@ -9,17 +9,11 @@ const FIXED_TUNNEL_ID = process.env.FIXED_TUNNEL_ID || "";
 const MAX_BODY = 6 * 1024 * 1024;
 const LINK_STALE_MS = 45_000;
 const WORK_TIMEOUT_MS = 120_000;
+const AGENTS = new Set(["pc", "android"]);
 
-let runtimeKey = null;
-let linkToken = null;
-let initResult = null;
-let toolsListResult = null;
-let lastLinkAt = 0;
 let tunnelChild = null;
-
-const workQueue = [];
-const workPending = new Map();
-const pollWaiters = [];
+let tunnelRuntimeKey = null;
+const links = new Map();
 
 function json(res, status, body, headers = {}) {
   const payload = JSON.stringify(body);
@@ -48,14 +42,106 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
-function authorizedLink(req) {
-  if (!linkToken) return false;
-  const value = req.headers.authorization || "";
-  return value === `Bearer ${linkToken}`;
+function newLink(agentId, initResult, toolsListResult) {
+  return {
+    agentId,
+    linkToken: randomBytes(32).toString("base64url"),
+    initResult,
+    toolsListResult,
+    lastLinkAt: Date.now(),
+    workQueue: [],
+    workPending: new Map(),
+    pollWaiters: [],
+  };
 }
 
-function linkFresh() {
-  return Boolean(linkToken && Date.now() - lastLinkAt < LINK_STALE_MS);
+function linkFresh(link) {
+  return Boolean(link && Date.now() - link.lastLinkAt < LINK_STALE_MS);
+}
+
+function linkByToken(req) {
+  const value = req.headers.authorization || "";
+  if (!value.startsWith("Bearer ")) return null;
+  const token = value.slice(7);
+  for (const link of links.values()) {
+    if (link.linkToken === token) return link;
+  }
+  return null;
+}
+
+function clearAgentLink(agentId, reason = "link_closed") {
+  const link = links.get(agentId);
+  if (!link) return;
+  links.delete(agentId);
+
+  while (link.pollWaiters.length) {
+    const waiter = link.pollWaiters.shift();
+    clearTimeout(waiter.timer);
+    try { empty(waiter.res, 401); } catch {}
+  }
+
+  while (link.workQueue.length) {
+    const item = link.workQueue.shift();
+    const pending = link.workPending.get(item.id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error(reason));
+      link.workPending.delete(item.id);
+    }
+  }
+
+  for (const [id, pending] of link.workPending) {
+    clearTimeout(pending.timer);
+    pending.reject(new Error(reason));
+    link.workPending.delete(id);
+  }
+}
+
+function dispatchWork(link) {
+  while (link.workQueue.length && link.pollWaiters.length) {
+    const item = link.workQueue.shift();
+    const waiter = link.pollWaiters.shift();
+    clearTimeout(waiter.timer);
+    link.lastLinkAt = Date.now();
+    json(waiter.res, 200, item);
+  }
+}
+
+function enqueueWork(agentId, method, params) {
+  const link = links.get(agentId);
+  if (!linkFresh(link)) return Promise.reject(new Error(`${agentId}_link_unavailable`));
+  const id = randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      link.workPending.delete(id);
+      reject(new Error(`${agentId}_work_timeout`));
+    }, WORK_TIMEOUT_MS);
+    link.workPending.set(id, { resolve, reject, timer });
+    link.workQueue.push({ id, method, params: params ?? {} });
+    dispatchWork(link);
+  });
+}
+
+function mergedTools() {
+  const out = [];
+  const pc = links.get("pc")?.toolsListResult?.tools;
+  if (Array.isArray(pc)) out.push(...pc);
+
+  const android = links.get("android")?.toolsListResult?.tools;
+  if (Array.isArray(android)) {
+    for (const tool of android) {
+      out.push({
+        ...tool,
+        name: `android__${tool.name}`,
+        description: `[Android] ${tool.description || tool.name}`,
+      });
+    }
+  }
+  return out;
+}
+
+function initializeResult() {
+  return links.get("pc")?.initResult || links.get("android")?.initResult || null;
 }
 
 function killTunnel() {
@@ -63,60 +149,6 @@ function killTunnel() {
     try { tunnelChild.kill("SIGTERM"); } catch {}
   }
   tunnelChild = null;
-}
-
-function clearLink(reason = "link_closed") {
-  killTunnel();
-  linkToken = null;
-  runtimeKey = null;
-  initResult = null;
-  toolsListResult = null;
-  lastLinkAt = 0;
-
-  while (pollWaiters.length) {
-    const waiter = pollWaiters.shift();
-    clearTimeout(waiter.timer);
-    try { empty(waiter.res, 401); } catch {}
-  }
-
-  while (workQueue.length) {
-    const item = workQueue.shift();
-    const pending = workPending.get(item.id);
-    if (pending) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error(reason));
-      workPending.delete(item.id);
-    }
-  }
-  for (const [id, pending] of workPending) {
-    clearTimeout(pending.timer);
-    pending.reject(new Error(reason));
-    workPending.delete(id);
-  }
-}
-
-function dispatchWork() {
-  while (workQueue.length && pollWaiters.length) {
-    const item = workQueue.shift();
-    const waiter = pollWaiters.shift();
-    clearTimeout(waiter.timer);
-    lastLinkAt = Date.now();
-    json(waiter.res, 200, item);
-  }
-}
-
-function enqueueWork(method, params) {
-  if (!linkFresh()) return Promise.reject(new Error("pc_link_unavailable"));
-  const id = randomUUID();
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      workPending.delete(id);
-      reject(new Error("pc_work_timeout"));
-    }, WORK_TIMEOUT_MS);
-    workPending.set(id, { resolve, reject, timer });
-    workQueue.push({ id, method, params: params ?? {} });
-    dispatchWork();
-  });
 }
 
 async function validateRuntimeKey(tunnelId, key) {
@@ -131,9 +163,9 @@ async function validateRuntimeKey(tunnelId, key) {
         headers: {
           authorization: `Bearer ${key}`,
           accept: "application/json",
-          "user-agent": "mcp-edge-relay-bootstrap/1.0",
+          "user-agent": "mcp-edge-relay-bootstrap/1.1",
           "x-tunnel-client-name": "mcp-edge-relay-bootstrap",
-          "x-tunnel-client-version": "1.0.0",
+          "x-tunnel-client-version": "1.1.0",
         },
         signal: controller.signal,
       },
@@ -160,8 +192,9 @@ async function waitTunnelReady(timeoutMs = 10_000) {
   return false;
 }
 
-async function startTunnelClient(tunnelId, key) {
-  killTunnel();
+async function ensureTunnelClient(tunnelId, key) {
+  if (tunnelChild && !tunnelChild.killed) return;
+  tunnelRuntimeKey = key;
   const env = {
     ...process.env,
     CONTROL_PLANE_TUNNEL_ID: tunnelId,
@@ -190,6 +223,7 @@ async function startTunnelClient(tunnelId, key) {
 
   if (!(await waitTunnelReady())) {
     killTunnel();
+    tunnelRuntimeKey = null;
     throw new Error("tunnel_start_timeout");
   }
 }
@@ -214,26 +248,27 @@ const mcpServer = http.createServer(async (req, res) => {
   if (!hasId) return empty(res, 202);
 
   if (method === "initialize") {
-    if (!initResult) {
+    const init = initializeResult();
+    if (!init) {
       return json(res, 200, {
         jsonrpc: "2.0",
         id: body.id,
-        error: { code: -32000, message: "PC link not ready" },
+        error: { code: -32000, message: "No agent link ready" },
       });
     }
     return json(
       res,
       200,
-      { jsonrpc: "2.0", id: body.id, result: initResult },
+      { jsonrpc: "2.0", id: body.id, result: init },
       { "mcp-session-id": `edge-${randomUUID()}` },
     );
   }
 
-  if (method === "tools/list" && toolsListResult) {
+  if (method === "tools/list") {
     return json(res, 200, {
       jsonrpc: "2.0",
       id: body.id,
-      result: toolsListResult,
+      result: { tools: mergedTools() },
     });
   }
 
@@ -241,8 +276,15 @@ const mcpServer = http.createServer(async (req, res) => {
     return json(res, 200, { jsonrpc: "2.0", id: body.id, result: {} });
   }
 
+  let agentId = "pc";
+  let params = body.params ?? {};
+  if (method === "tools/call" && typeof params?.name === "string" && params.name.startsWith("android__")) {
+    agentId = "android";
+    params = { ...params, name: params.name.slice("android__".length) };
+  }
+
   try {
-    const reply = await enqueueWork(method, body.params ?? {});
+    const reply = await enqueueWork(agentId, method, params);
     if (reply?.error) {
       return json(res, 200, { jsonrpc: "2.0", id: body.id, error: reply.error });
     }
@@ -262,13 +304,22 @@ const publicServer = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
 
   if (req.method === "GET" && url.pathname === "/health") {
+    const agents = {};
+    for (const id of AGENTS) {
+      const link = links.get(id);
+      agents[id] = {
+        connected: Boolean(link),
+        fresh: linkFresh(link),
+        queued_work: link?.workQueue.length || 0,
+        pending_work: link?.workPending.size || 0,
+        tools: Array.isArray(link?.toolsListResult?.tools) ? link.toolsListResult.tools.length : 0,
+      };
+    }
     return json(res, 200, {
       status: "ok",
-      bootstrapped: Boolean(linkToken),
-      link_fresh: linkFresh(),
       tunnel_client_running: Boolean(tunnelChild && !tunnelChild.killed),
-      queued_work: workQueue.length,
-      pending_work: workPending.size,
+      agents,
+      exposed_tools: mergedTools().length,
     });
   }
 
@@ -277,6 +328,8 @@ const publicServer = http.createServer(async (req, res) => {
     try { body = await readJson(req); }
     catch { return json(res, 400, { error: "invalid_json" }); }
 
+    const agentId = typeof body.agentId === "string" ? body.agentId : "pc";
+    if (!AGENTS.has(agentId)) return json(res, 400, { error: "invalid_agent_id" });
     if (
       typeof body.runtimeKey !== "string" ||
       typeof body.tunnelId !== "string" ||
@@ -290,65 +343,66 @@ const publicServer = http.createServer(async (req, res) => {
       return json(res, 403, { error: "invalid_tunnel_credentials" });
     }
 
-    clearLink("rebootstrap");
-    runtimeKey = body.runtimeKey;
-    initResult = body.initializeResult;
-    toolsListResult = body.toolsListResult;
-    linkToken = randomBytes(32).toString("base64url");
-    lastLinkAt = Date.now();
-
     try {
-      await startTunnelClient(body.tunnelId, runtimeKey);
+      await ensureTunnelClient(body.tunnelId, body.runtimeKey);
     } catch {
-      clearLink("tunnel_start_failed");
       return json(res, 503, { error: "tunnel_start_failed" });
     }
 
+    clearAgentLink(agentId, "rebootstrap");
+    const link = newLink(agentId, body.initializeResult, body.toolsListResult);
+    links.set(agentId, link);
+
     return json(res, 200, {
       ok: true,
-      linkToken,
-      tools: Array.isArray(toolsListResult?.tools) ? toolsListResult.tools.length : 0,
+      agentId,
+      linkToken: link.linkToken,
+      tools: Array.isArray(body.toolsListResult?.tools) ? body.toolsListResult.tools.length : 0,
+      exposedTools: mergedTools().length,
     });
   }
 
   if (req.method === "POST" && url.pathname === "/link/poll") {
-    if (!authorizedLink(req)) return empty(res, 401);
-    lastLinkAt = Date.now();
+    const link = linkByToken(req);
+    if (!link) return empty(res, 401);
+    link.lastLinkAt = Date.now();
 
-    if (workQueue.length) {
-      const item = workQueue.shift();
+    if (link.workQueue.length) {
+      const item = link.workQueue.shift();
       return json(res, 200, item);
     }
 
     const waiter = { res, timer: null };
     waiter.timer = setTimeout(() => {
-      const index = pollWaiters.indexOf(waiter);
-      if (index >= 0) pollWaiters.splice(index, 1);
-      lastLinkAt = Date.now();
+      const index = link.pollWaiters.indexOf(waiter);
+      if (index >= 0) link.pollWaiters.splice(index, 1);
+      link.lastLinkAt = Date.now();
       empty(res, 204);
     }, 15_000);
-    pollWaiters.push(waiter);
+    link.pollWaiters.push(waiter);
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/link/response") {
-    if (!authorizedLink(req)) return empty(res, 401);
-    lastLinkAt = Date.now();
+    const link = linkByToken(req);
+    if (!link) return empty(res, 401);
+    link.lastLinkAt = Date.now();
     let body;
     try { body = await readJson(req); }
     catch { return json(res, 400, { error: "invalid_json" }); }
 
-    const pending = workPending.get(body.id);
+    const pending = link.workPending.get(body.id);
     if (!pending) return empty(res, 404);
-    workPending.delete(body.id);
+    link.workPending.delete(body.id);
     clearTimeout(pending.timer);
     pending.resolve({ result: body.result, error: body.error });
     return empty(res, 204);
   }
 
   if (req.method === "POST" && url.pathname === "/link/disconnect") {
-    if (!authorizedLink(req)) return empty(res, 401);
-    clearLink("pc_disconnect");
+    const link = linkByToken(req);
+    if (!link) return empty(res, 401);
+    clearAgentLink(link.agentId, `${link.agentId}_disconnect`);
     return empty(res, 204);
   }
 
@@ -356,13 +410,17 @@ const publicServer = http.createServer(async (req, res) => {
 });
 
 setInterval(() => {
-  if (linkToken && Date.now() - lastLinkAt > LINK_STALE_MS) {
-    clearLink("pc_link_stale");
+  for (const [agentId, link] of links) {
+    if (Date.now() - link.lastLinkAt > LINK_STALE_MS) {
+      clearAgentLink(agentId, `${agentId}_link_stale`);
+    }
   }
 }, 5_000).unref();
 
 function shutdown() {
-  clearLink("edge_shutdown");
+  for (const agentId of [...links.keys()]) clearAgentLink(agentId, "edge_shutdown");
+  killTunnel();
+  tunnelRuntimeKey = null;
   publicServer.close();
   mcpServer.close();
 }
