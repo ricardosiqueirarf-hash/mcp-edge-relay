@@ -6,6 +6,7 @@ const PUBLIC_PORT = Number(process.env.PORT || 10000);
 const MCP_PORT = 18770;
 const TUNNEL_HEALTH_PORT = 18771;
 const FIXED_TUNNEL_ID = process.env.FIXED_TUNNEL_ID || "";
+const EDGE_BENCH_TOKEN = process.env.EDGE_BENCH_TOKEN || "";
 const MAX_BODY = 6 * 1024 * 1024;
 const LINK_STALE_MS = 45_000;
 const WORK_TIMEOUT_MS = 120_000;
@@ -270,6 +271,29 @@ const publicServer = http.createServer(async (req, res) => {
       queued_work: workQueue.length,
       pending_work: workPending.size,
     });
+  }
+
+  if (req.method === "POST" && url.pathname === "/bench/get-config") {
+    const auth = req.headers.authorization || "";
+    if (!EDGE_BENCH_TOKEN || auth !== "Bearer " + EDGE_BENCH_TOKEN) return empty(res, 401);
+    if (!linkFresh()) return json(res, 503, { ok: false, error: "pc_link_unavailable" });
+
+    const started = performance.now();
+    try {
+      const reply = await enqueueWork("tools/call", { name: "get_config", arguments: {} });
+      const elapsedMs = performance.now() - started;
+      return json(res, 200, {
+        ok: !reply?.error,
+        elapsed_ms: Math.round(elapsedMs * 10) / 10,
+        error_code: reply?.error?.code ?? null,
+      });
+    } catch (error) {
+      return json(res, 503, {
+        ok: false,
+        elapsed_ms: Math.round((performance.now() - started) * 10) / 10,
+        error: String(error?.message || error),
+      });
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/bootstrap") {
